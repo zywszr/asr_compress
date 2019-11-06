@@ -6,7 +6,7 @@ import numpy as np
 import fsmn_pytorch
 import math
 
-from utils import *
+from utils import to_tensor, to_numpy
 from sklearn.cluster import KMeans
 from asr.trainer.args import get_scp
 from asr.utils import SequenceDataset
@@ -24,13 +24,18 @@ class Env:
 
         # quantify
         self.compressible_layer_types = [torch.nn.modules.linear.Linear, fsmn_pytorch.FSMN]
+        self.total_size = 0     # total size of all parameters
+        self.layer_size = []    # size of parameters of each layer
+        self.layer_params = []  # kinds of parameters of each layer
         self._build_idx()
-        self.cur_ind = 0
+        self._build_state_embedding()
+        self.cur_ind = 0    # current index of layer
+        self.cur_size = 0   # current size of compressed layers
         self.strategy_bits = []
-        self.compressed_params = []
+        self.compressed_params = {}
 
         # validate
-        _, self.cv_scp = get_scp(args, world_size=1, rank=0)  # args ???
+        _, self.cv_scp = get_scp(args, world_size=1, rank=0)
         self.valid_set = SequenceDataset(*self.cv_scp, 32, targets_delay=args.targets_delay,
                                     skip_frame=args.skip_frames, hybrid=True,
                                     feature_transform=args.feature_transform)
@@ -49,6 +54,17 @@ class Env:
         for i, layer in enumerate(self.model.modules()):
             if type(layer) in self.compressible_layer_types:
                 self.compressible_idx.append(i)
+
+                size = 0
+                kind = 0
+                for param in layer.parameters():
+                    size += np.prod(param.data.size())
+                    kind += 1
+
+                self.total_size += size * 32
+                self.layer_size.append(size)
+                self.layer_params.append(kind)
+
         self.compressible_length = len(self.compressible_idx)
 
     def _build_state_embedding(self):
@@ -69,7 +85,7 @@ class Env:
                 this_state.append(layer.filter.shape[1])    # in channels
                 this_state.append(layer.filter.shape[1])    # out channels
                 this_state.append(layer.filter.shape[0])    # l_order + r_order + 1
-                this_state.append(np.prod(layer.filter.weight.size()))
+                this_state.append(np.prod(layer.filter.size()))
 
             this_state.append(1)    # the action of last layer
             layer_embedding.append(this_state)
@@ -84,21 +100,31 @@ class Env:
 
         self.layer_embedding = layer_embedding
 
-    def step(self, action):
+    def step(self, action, show=False):
         self.strategy_bits.append(action)
+        self.cur_size += self.layer_size[self.cur_ind] * action + \
+                         self.layer_params[self.cur_ind] * (2 ** action) * 32
+
         if self.cur_ind == self.compressible_length - 1:    # the final layer
             # get reward
-            self._quantify_model()
+            if not show:
+                self.quantify_model()
             loss, acc = self._validate()
+            compress_ratio = 1. * self.cur_size / self.total_size
+            reward = -loss * math.log(self.cur_size)
+            self.log_writer.write('# {}: episode_reward: {:.4f} loss: {:.4f} acc: {:.4f}, ratio: {:.4f}\n'.format(
+                                    self.trajectory, reward, loss, acc, compress_ratio))
+            self.log_writer.flush()            
+
             self.trajectory += 1
-            reward = self.reward()
 
             if reward > self.best_reward:
                 self.best_reward = reward
                 self.best_strategy = self.strategy_bits.copy()
-                prGreen('')
+                self.log_writer.write('best_reward: {} best_strategy: {}\n'.format(self.best_reward, self.best_strategy))
+                self.log_writer.flush()
 
-            info_set = {'loss': loss, 'acc': acc}
+            info_set = {'loss': loss, 'acc': acc, 'compress_ratio': compress_ratio}
             state_next = self.layer_embedding[self.cur_ind, :].copy()
             done = True
             # export ???
@@ -126,6 +152,7 @@ class Env:
             length = torch.tensor(length, dtype=torch.int32)
             mask = torch.arange(feat.shape[0], dtype=torch.int32).view(-1, 1) < \
                    length.view(1, -1)
+
         ali = torch.tensor(ali).long().view(-1).cuda()
         length = length.cuda(non_blocking=True)
 
@@ -142,10 +169,16 @@ class Env:
     def _validate(self):
         self.model.eval()
         self.epoch_accumor.clear()
+        self.log_writer.write('# {}: start validate\n'.format(self.trajectory))
+        self.log_writer.flush()
 
         with torch.no_grad():
             while True:
+                # self.log_writer.write('prepare batch\n')
+                # self.log_writer.flush()
                 batch = self.valid_queue.get()
+                # self.log_writer.write('get batch\n')
+                # self.log_writer.flush()
                 if batch is None:
                     break
                 statics, loss = self._forward_model(batch)
@@ -156,20 +189,26 @@ class Env:
         stats = self.epoch_accumor.reduce
         loss = stats['loss'] / stats['frames']
         acc = 100 * stats['acc'] / stats['frames']
-        self.log_writer('Trajectory {}: batches {}, frames {}, loss {:.2f}, acc {:.2f}\n'.format(
-                        self.trajectory, self.epoch_accumor.step, stats['frames'], loss, acc))
+        self.log_writer.write('# {}: batches {}, frames {}, loss {:.2f}, acc {:.2f}\n'.format(self.trajectory, self.epoch_accumor.step, stats['frames'], loss, acc))
+        self.log_writer.flush()
 
         return loss, acc
 
-    def _quantify_model(self):
+    def quantify_model(self):
         modules = list(self.model.named_modules())
         for i, ind in enumerate(self.compressible_idx):
             layer_name = modules[ind][0]
             layer = modules[ind][1]
-            for name, param in layer.name_parameters:
+            for name, param in layer.named_parameters():
                 param_name = '{}.{}_{}bit'.format(layer_name, name, self.strategy_bits[i])
+                self.log_writer.write(param_name + '\n')
+                self.log_writer.flush()
+
                 if not self.compressed_params.__contains__(param_name):  # quantify parameters
                     num = 2 ** self.strategy_bits[i]
+                    if not type(num) == int:
+                        print("num is not integer")
+
                     tmp_param = param.data.view(-1)
                     if num >= len(tmp_param):   # do nothing
                         index = to_tensor(np.array(range(len(tmp_param)))).int()
@@ -180,16 +219,17 @@ class Env:
                         index = torch.Tensor(estimator.labels_).int()
                         index = index.view(param.data.shape)
 
-                    center = [param.data[index == i].mean() for i in range(num)]
-                    self.compressed_params[name + 'c'] = to_tensor(np.array(center))
-                    self.compressed_params[name + 'i'] = index
+                    center = [param.data[index == i].mean().item() for i in range(num)]
+                    self.compressed_params[param_name + 'c'] = to_tensor(center)
+                    self.compressed_params[param_name + 'i'] = index
 
-                idx = self.compressed_params[name + 'i'].long()
-                param.data.copy_(self.compressed_params[name + 'c'][idx])
+                idx = self.compressed_params[param_name + 'i'].long()
+                param.data.copy_(self.compressed_params[param_name + 'c'][idx])
 
     def reset(self):
         self.model.load_state_dict(self.ckp)
         self.cur_ind = 0
+        self.cur_size = 0
         self.strategy_bits = []
         self.layer_embedding[:, -1] = 1.
         state = self.layer_embedding[0].copy()

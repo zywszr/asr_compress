@@ -48,7 +48,7 @@ class SequentialMemory(object):
     def sample_batch_indexes(self, low, high, size):
         # sample indexes from [low, high)
         if high - low >= size:
-            batch_idxs = random.sample(range(low, high), size=size)
+            batch_idxs = random.sample(range(low, high), size)
         else:
             warnings.warn(
                 'Not enough entries to sample without replacement. '
@@ -66,7 +66,7 @@ class SequentialMemory(object):
             action = self.actions[idx]
             reward = self.rewards[idx]
             next_state = self.states[idx + 1]
-            terminal = self.states[idx]
+            terminal = self.terminals[idx]
             experiences.append(Experience(state=state, action=action, reward=reward,
                                           next_state=next_state, terminal=terminal))
 
