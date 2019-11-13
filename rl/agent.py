@@ -50,10 +50,11 @@ class DDPG(object):
     def __init__(self, n_state, log_writer, args):
         self.n_state = n_state
         self.log_writer = log_writer
+        self.output = args.output
 
         self.action_start = args.action_start
         self.action_end = args.action_end
-        self.n_action = self.action_end - self.action_start + 1
+        self.n_action = self.action_end - self.action_start + 1        
 
         # create actor and critic network
         net_config = {'n_state': self.n_state, 'n_action': self.n_action,
@@ -103,7 +104,10 @@ class DDPG(object):
     def select_action(self, state):
         action_prob = to_numpy(self.actor(to_tensor(state.reshape(1, -1)))).squeeze(0)
         dice = stats.rv_discrete(values=(range(self.action_start, self.action_end + 1), action_prob))
-        action = dice.rvs(size=1)
+        action = dice.rvs(size=1)    
+    
+        # print(action_prob)
+        # print('select action: {}'.format(action[0]))
         return action[0]
 
     def get_exact_action(self, state_batch, kind):
@@ -118,7 +122,7 @@ class DDPG(object):
 
     def update_policy(self):
         # sample batch
-        print('start update policy\n')
+        # print('start update policy\n')
         # self.log_writer.flush()
 
         state_batch, action_batch, reward_batch, \
@@ -156,7 +160,7 @@ class DDPG(object):
         policy_loss.backward()
         self.actor_optim.step()
         
-        print('end update policy\n')
+        # print('end update policy\n')
         # self.log_writer.flush()
         
         # target network update
@@ -176,3 +180,13 @@ class DDPG(object):
     def append_replay(self, s_t, a_t, r_t, done):
         self.memory.append(s_t, a_t, r_t, done)
 
+    def save_model(self, num):
+        torch.save(self.actor.state_dict(), '{}/actor-{}.pkl'.format(self.output, num))
+        torch.save(self.critic.state_dict(), '{}/critic-{}.pkl'.format(self.output, num))
+
+    def load_weights(self, state_dir, num):
+        self.actor.load_state_dict(torch.load('{}/actor-{}.pkl'.format(state_dir, num)))
+        self.critic.load_state_dict(torch.load('{}/critic-{}.pkl'.format(state_dir, num)))
+        self.actor_target.load_state_dict(torch.load('{}/actor-{}.pkl'.format(state_dir, num)))
+        self.critic_target.load_state_dict(torch.load('{}/critic-{}.pkl'.format(state_dir, num)))
+    

@@ -26,24 +26,27 @@ def parse_args():
     parser.add_argument('--hidden1', default=400, type=int)
     parser.add_argument('--hidden2', default=300, type=int)
     parser.add_argument('--rmsize', default=100, type=int, help='memory size for each layer')
-    parser.add_argument('--bsize', default=16, type=int, help='minibatch size for train agent')
+    parser.add_argument('--bsize', default=64, type=int, help='minibatch size for train agent')
     parser.add_argument('--lr_c', default=1e-3, type=float, help='learning rate for critic')
     parser.add_argument('--lr_a', default=1e-4, type=float, help='learning rate for actor')
     parser.add_argument('--discount', default=1., type=float)
-    parser.add_argument('--tau', default=0.01, type=float, help='moving average for target network')
+    parser.add_argument('--tau', default=0.1, type=float, help='moving average for target network')
     parser.add_argument('--moving_alpha', default=0.5, type=float)
     parser.add_argument('--action_start', default=3, type=int)
-    parser.add_argument('--action_end', default=4, type=int)
-
+    parser.add_argument('--action_end', default=8, type=int)
+    parser.add_argument('--quantify_kind', default='linear', type=str)
+    parser.add_argument('--save_internal', default=50, type=int)
 
     # train
     parser.add_argument('--job', default='train', type=str)
     parser.add_argument('--output', default='./rl/search', type=str)
-    parser.add_argument('--episode', default=4, type=int, help='episode of training')
-    parser.add_argument('--seed', default=1997, type=int, help='random seed to set')
-    parser.add_argument('--warmup', default=2, type=int,
+    parser.add_argument('--episode', default=1000, type=int, help='episode of training')
+    parser.add_argument('--seed', default=2019, type=int, help='random seed to set')
+    parser.add_argument('--warmup', default=20, type=int,
                         help='time without training but only filling the replay memory')
     parser.add_argument('--n-gpu', default=1, type=int, help='number of gpu to use')
+    parser.add_argument('--resume', default='rl/search/tau0.1-run22', type=str)
+    parser.add_argument('--resumenum', default=5, type=int)
 
     # dataset
     parser.add_argument('--hybrid', type=str2bool, default=False)
@@ -58,7 +61,7 @@ def parse_args():
                         help='splice window, [left, right]')
     parser.add_argument('--cmvn-opts', type=str, default='')
     parser.add_argument('--online-cmvn', type=str2bool, default=False)
-
+    
     # process
     parser.add_argument('--targets-delay', type=int, default=0, help='delay targets')
     parser.add_argument('--skip-frames', type=int, default=1, help='skip frames')
@@ -131,7 +134,11 @@ def train(num_episode, agent, env, output):
                 # log_writer.write('best reward: {}\n'.format(env.best_reward))
                 # log_writer.write('best policy: {}\n'.format(env.best_strategy))
                 break
+        
+        if ((cur_episode + 1) % args.save_internal == 0):
+            agent.save_model((cur_episode + 1) // args.save_internal)        
 
+    # agent.save_model()
     log_writer.close()
 
 
@@ -150,7 +157,7 @@ if __name__ == "__main__":
 
     if args.job == 'train':
         # build folder and log
-        folder_name = 'test'
+        folder_name = 'tau{}'.format(args.tau)
         args.output = get_output_folder(args.output, folder_name)
         print('=> Saving logs to {}'.format(args.output))
         tf_writer = SummaryWriter(logdir=args.output)
@@ -160,5 +167,8 @@ if __name__ == "__main__":
         args.rmsize = args.rmsize * env.compressible_length
         n_state = env.layer_embedding.shape[1]
         agent = DDPG(n_state, log_writer, args)
+        if args.resume != '':
+            print('<= Loading weights from {}/actor_critic-{}.pkl'.format(args.resume, args.resumenum))
+            agent.load_weights(args.resume, args.resumenum)
 
         train(args.episode, agent, env, args.output)

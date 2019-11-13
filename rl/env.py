@@ -33,6 +33,7 @@ class Env:
         self.cur_size = 0   # current size of compressed layers
         self.strategy_bits = []
         self.compressed_params = {}
+        self.quantify_kind = args.quantify_kind
 
         # validate
         _, self.cv_scp = get_scp(args, world_size=1, rank=0)
@@ -112,8 +113,8 @@ class Env:
             loss, acc = self._validate()
             compress_ratio = 1. * self.cur_size / self.total_size
             reward = -loss * math.log(self.cur_size)
-            self.log_writer.write('# {}: episode_reward: {:.4f} loss: {:.4f} acc: {:.4f}, ratio: {:.4f}\n'.format(
-                                    self.trajectory, reward, loss, acc, compress_ratio))
+            self.log_writer.write('# {}: episode_reward: {:.4f} loss: {:.4f} acc: {:.4f}, ratio: {:.4f}, best_reward: {:.4f}\n'.format(
+                                    self.trajectory, reward, loss, acc, compress_ratio, self.best_reward))
             self.log_writer.flush()            
 
             self.trajectory += 1
@@ -169,16 +170,18 @@ class Env:
     def _validate(self):
         self.model.eval()
         self.epoch_accumor.clear()
-        self.log_writer.write('# {}: start validate\n'.format(self.trajectory))
-        self.log_writer.flush()
-
+        # self.log_writer.write('# {}: start validate\n'.format(self.trajectory))
+        # self.log_writer.flush()
+        # print('start validate')
         with torch.no_grad():
             while True:
                 # self.log_writer.write('prepare batch\n')
                 # self.log_writer.flush()
+                # print('prepare batch\n')
                 batch = self.valid_queue.get()
                 # self.log_writer.write('get batch\n')
                 # self.log_writer.flush()
+                # print('get batch\n')
                 if batch is None:
                     break
                 statics, loss = self._forward_model(batch)
@@ -186,11 +189,12 @@ class Env:
                 torch.cuda.empty_cache()
                 self.epoch_accumor(statics)
 
+        # print('end validate')
         stats = self.epoch_accumor.reduce
         loss = stats['loss'] / stats['frames']
         acc = 100 * stats['acc'] / stats['frames']
-        self.log_writer.write('# {}: batches {}, frames {}, loss {:.2f}, acc {:.2f}\n'.format(self.trajectory, self.epoch_accumor.step, stats['frames'], loss, acc))
-        self.log_writer.flush()
+        # self.log_writer.write('# {}: batches {}, frames {}, loss {:.2f}, acc {:.2f}\n'.format(self.trajectory, self.epoch_accumor.step, stats['frames'], loss, acc))
+        # self.log_writer.flush()
 
         return loss, acc
 
@@ -201,23 +205,31 @@ class Env:
             layer = modules[ind][1]
             for name, param in layer.named_parameters():
                 param_name = '{}.{}_{}bit'.format(layer_name, name, self.strategy_bits[i])
-                self.log_writer.write(param_name + '\n')
-                self.log_writer.flush()
+                # self.log_writer.write(param_name + '\n')
+                # self.log_writer.flush()
 
                 if not self.compressed_params.__contains__(param_name):  # quantify parameters
                     num = 2 ** self.strategy_bits[i]
-                    if not type(num) == int:
-                        print("num is not integer")
+                    # if not type(num) == int:
+                        # print("num is not integer")
+                        # print(type(num))
 
-                    tmp_param = param.data.view(-1)
-                    if num >= len(tmp_param):   # do nothing
-                        index = to_tensor(np.array(range(len(tmp_param)))).int()
-                        index = index.view(param.data.shape)
-                    else:   # k-means
-                        estimator = KMeans(n_clusters=num)
-                        estimator.fit(tmp_param.reshape(-1, 1).cpu())
-                        index = torch.Tensor(estimator.labels_).int()
-                        index = index.view(param.data.shape)
+                    if self.quantify_kind == 'linear':
+                        min = param.data.min()
+                        unit = (param.data.max() - min) / num
+                        index = (param.data - min) / unit
+                        index = index.int()
+                        index[index == num] -= 1
+                    else:
+                        tmp_param = param.data.view(-1)
+                        if num >= len(tmp_param):   # do nothing
+                            index = to_tensor(np.array(range(len(tmp_param)))).int()
+                            index = index.view(param.data.shape)
+                        else:   # k-means
+                            estimator = KMeans(n_clusters=num)
+                            estimator.fit(tmp_param.reshape(-1, 1).cpu())
+                            index = torch.Tensor(estimator.labels_).int()
+                            index = index.view(param.data.shape)
 
                     center = [param.data[index == i].mean().item() for i in range(num)]
                     self.compressed_params[param_name + 'c'] = to_tensor(center)
